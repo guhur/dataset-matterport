@@ -1,5 +1,6 @@
 from typing import List, Union, Optional, Tuple, Dict
 from typing_extensions import TypedDict
+from collections import defaultdict
 from pathlib import Path
 import torch
 from torch.utils.data import Dataset
@@ -44,7 +45,10 @@ def _generate_label_map(scene, verbose=False) -> Tuple[Dict[int, str], Dict[int,
                 continue
             obj_id = int(obj.id.split("_")[-1])
             instance_id_to_object_name[obj_id] = obj.category.name()
-            instance_id_to_room_name[obj_id] = region.category.name()
+
+            # you might see a wall while not being able to recognize the room
+            if obj.category.name() not in ("wall", "floor", "ceiling", "door"):
+                instance_id_to_room_name[obj_id] = region.category.name()
 
     return instance_id_to_object_name, instance_id_to_room_name
 
@@ -66,7 +70,8 @@ class MatterportDataset(Dataset):
         img_size: Tuple[int, int] = (512, 512),
         rgb: bool = True,
         depth: bool = False,
-        discard: Tuple[str] = ("misc", "",),
+        discard: Tuple[str] = ("misc", "", "objects"),
+        threshold: float = 0.01,
         data_dir: Path = Path("data/"),
     ):
         """
@@ -79,6 +84,7 @@ class MatterportDataset(Dataset):
         self.rgb = rgb
         self.depth = depth
         self.discard = discard
+        self.threshold = threshold
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True, parents=True)
 
@@ -101,23 +107,38 @@ class MatterportDataset(Dataset):
         # try first to load voc
         if voc_file.is_file():
             voc = torch.load(voc_file)
-            self.instance_id_to_object_name = voc["instance_id_to_object_name"]
-            self.instance_id_to_room_name = voc["instance_id_to_room_name"]
-            self.object_names = voc["object_names"]
-            self.room_names = voc["room_names"]
+
+            if "discard" in voc and self.discard == voc["discard"]:
+                self.object_name_to_instance_ids = voc["object_name_to_instance_ids"]
+                self.room_name_to_instance_ids = voc["room_name_to_instance_ids"]
+                self.object_names = voc["object_names"]
+                self.room_names = voc["room_names"]
+                return
+
+        # compute the voc
+        instance_id_to_object_name, instance_id_to_room_name = _generate_label_map(
+            self.sim.semantic_scene
+        )
+        self.object_name_to_instance_ids = defaultdict(list)
+        for iid, name in instance_id_to_object_name.items():
+            if name not in self.discard:
+                self.object_name_to_instance_ids[name].append(iid)
             
-        else:
-            self.instance_id_to_object_name, self.instance_id_to_room_name = _generate_label_map(
-                self.sim.semantic_scene
-            )
-            self.room_names = Vocab(list(self.instance_id_to_room_name.values()))
-            self.object_names = Vocab(list(self.instance_id_to_object_name.values()))
-            torch.save({
-                "instance_id_to_object_name": self.instance_id_to_object_name,
-                "instance_id_to_room_name": self.instance_id_to_room_name,
-                "object_names": self.object_names,
-                "room_names": self.room_names,
-            }, voc_file)
+        self.room_name_to_instance_ids = defaultdict(list)
+        for iid, name in instance_id_to_room_name.items():
+            if name not in self.discard:
+                self.room_name_to_instance_ids[name].append(iid)
+
+        self.room_names = Vocab(list(self.room_name_to_instance_ids))
+        self.object_names = Vocab(list(self.object_name_to_instance_ids))
+
+        torch.save({
+            "discard": self.discard,
+            "room_name_to_instance_ids": self.room_name_to_instance_ids,
+            "object_name_to_instance_ids": self.object_name_to_instance_ids,
+            "object_names": self.object_names,
+            "room_names": self.room_names,
+        }, voc_file)
 
 
     def __len__(self) -> int:
@@ -130,21 +151,32 @@ class MatterportDataset(Dataset):
         new_state = AgentState()
         new_state.position = self.poses[index][:3]
 
-        rot = Rotation.from_euler('yz', self.poses[index][3:], degrees=False)
+        head = self.poses[index][3]
+        elev = self.poses[index][4]
+        rot = Rotation.from_euler('xy', [elev, head], degrees=False)
         new_state.rotation = rot.as_quat()
         self.sim.agents[0].set_state(new_state)
 
         obs = self.sim.get_sensor_observations()
         image = torch.Tensor(obs["color_sensor"]) if self.rgb else None
         depth = torch.Tensor(obs["depth_sensor"]) if self.depth else None
+        content_ids = obs["semantic_sensor"].flatten()
+        image_size = content_ids.size
 
-        content_ids = np.unique(obs["semantic_sensor"].flatten()).tolist()
-        object_name = set([self.instance_id_to_object_name[cid] for cid in content_ids])
-        object_name = filter( lambda x: x not in self.discard, object_name)
-        object_labels = [self.object_names.word2index(n) for n in object_name]
-        room_name = set([self.instance_id_to_room_name[cid] for cid in content_ids])
-        room_name = filter(lambda x: x not in self.discard, room_name)
-        room_types = [self.room_names.word2index(n) for n in room_name]
+        object_names = []
+        for name, iids in self.object_name_to_instance_ids.items():
+            ratio = np.isin(obs["semantic_sensor"], iids).sum()/image_size
+            if ratio > self.threshold:
+                object_names.append(name)
+                
+        room_names = []
+        for name, iids in self.room_name_to_instance_ids.items():
+            ratio = np.isin(obs["semantic_sensor"], iids).sum()/image_size
+            if ratio > self.threshold:
+                room_names.append(name)
+
+        object_labels = [self.object_names.word2index(n) for n in object_names]
+        room_types = [self.room_names.word2index(n) for n in room_names]
 
         return {
             "image": image,
@@ -247,8 +279,8 @@ def display_sample(sample: Dict[str, torch.Tensor], voc_file: Path):
             arr["image"] = sample["image"][i].long()
 
         plt.figure(figsize=(12, 8))
-        for i, (key, data) in enumerate(arr.items()):
-            ax = plt.subplot(1, len(arr), i + 1)
+        for j, (key, data) in enumerate(arr.items()):
+            ax = plt.subplot(1, len(arr), j + 1)
             ax.axis("off")
             ax.set_title(key)
             plt.imshow(data)
@@ -259,7 +291,7 @@ def display_sample(sample: Dict[str, torch.Tensor], voc_file: Path):
             if obj != -1:
                 print(object_voc.index2word(obj))
 
-        print(f"Room labels in sample {i}")
+        print(f"\nRoom labels in sample {i}")
         for room in sample["room_types"][i].long().tolist():
             if room != -1:
                 print(room_voc.index2word(room))
