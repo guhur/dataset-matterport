@@ -14,7 +14,6 @@ from habitat_sim import bindings as hsim
 from habitat_sim import registry as registry
 from habitat_sim.agent.agent import AgentConfiguration, AgentState
 
-#  from habitat_sim.utils.data.data_structures import ExtractorLRUCache
 
 PathOrStr = Union[str, Path]
 Sample = TypedDict(
@@ -70,7 +69,7 @@ class MatterportDataset(Dataset):
         img_size: Tuple[int, int] = (512, 512),
         rgb: bool = True,
         depth: bool = False,
-        discard: Tuple[str] = ("misc", "", "objects"),
+        discard: Tuple[str, ...] = ("misc", "", "objects"),
         threshold: float = 0.01,
         data_dir: Path = Path("data/"),
     ):
